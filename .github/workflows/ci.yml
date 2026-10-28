@@ -74,7 +74,7 @@ jobs:
         if: steps.detect.outputs.present == 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.detect.outputs.present == 'true'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.detect.outputs.present == 'true'
         with:
           node-version: lts/*
