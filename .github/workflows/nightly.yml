@@ -1,0 +1,60 @@
+name: Nightly assurance
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-long:
+    name: Fuzz (10 min per target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect fuzz targets
+        id: detect
+        run: |
+          if [ -f fuzz/Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: dtolnay/rust-toolchain@nightly
+        if: steps.detect.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.detect.outputs.present == 'true'
+      - name: Install cargo-fuzz
+        if: steps.detect.outputs.present == 'true'
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz every target
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          for target in $(cargo fuzz list); do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=600
+            echo "::endgroup::"
+          done
+      - name: Upload crashing inputs
+        if: failure() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  timing:
+    name: Constant-time checks (dudect-style)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Convention: statistical timing tests are named `timing_*` and marked #[ignore].
+      # Shared CI runners are noisy, so treat a single failure as a signal to re-run
+      # and look at the trend, not as proof of a leak.
+      - name: Run timing tests
+        run: cargo test --release --workspace -- --ignored timing_ --nocapture

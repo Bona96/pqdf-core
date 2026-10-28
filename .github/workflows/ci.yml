@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Assumes a Cargo workspace at the repository root. If your layout differs,
+# add `working-directory:` to the cargo steps or adjust the paths below.
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # If the napi-rs binding crate fails to link under `cargo test`,
+      # test the pure-Rust core crate with `-p <core-crate>` instead and
+      # exercise the binding through the Node.js job below.
+      - name: Test
+        run: cargo test --workspace --all-features
+      # Widen to a macOS/Windows matrix once native addon builds are in place.
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      # Requires Cargo.lock to be committed.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  node:
+    name: Node.js (build, test, audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Node.js project
+        id: detect
+        run: |
+          if [ -f package.json ]; then echo "present=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.detect.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.detect.outputs.present == 'true'
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version: lts/*
+          cache: npm
+      - name: Install
+        if: steps.detect.outputs.present == 'true'
+        run: npm ci
+      - name: Build (compiles the napi-rs addon)
+        if: steps.detect.outputs.present == 'true'
+        run: npm run build --if-present
+      - name: Test
+        if: steps.detect.outputs.present == 'true'
+        run: npm test --if-present
+      - name: Dependency audit
+        if: steps.detect.outputs.present == 'true'
+        run: npm audit --audit-level=high
+
+  fuzz-smoke:
+    name: Fuzz smoke test (60s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect fuzz targets
+        id: detect
+        run: |
+          if [ -f fuzz/Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: dtolnay/rust-toolchain@nightly
+        if: steps.detect.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.detect.outputs.present == 'true'
+      - name: Install cargo-fuzz
+        if: steps.detect.outputs.present == 'true'
+        run: cargo install cargo-fuzz --locked
+      - name: Run each target briefly
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          for target in $(cargo fuzz list); do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=60
+            echo "::endgroup::"
+          done
+      - name: Upload crashing inputs
+        if: failure() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  sbom:
+    name: SBOM (CycloneDX)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json
+      # Output file names vary by cargo-cyclonedx version; verify on the first run.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            **/*.cdx.json
+            **/bom.json
+          if-no-files-found: warn
